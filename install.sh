@@ -1,4 +1,9 @@
 #!/bin/bash
+
+# NVIDIA Easy Installation Script.
+# Implemented by Victor Ribeiro <victor.ribeiro@suse.com>
+
+
 set -euo pipefail
 
 ########################################
@@ -27,7 +32,7 @@ UBUNTU_DRIVER_PKG="nvidia-driver-535"
 # Flags default values
 INSTALL_DRIVER=true
 INSTALL_OPERATOR=true
-ENABLE_REBOOT=false  # Automatic reboot disabled by default
+ENABLE_REBOOT=false
 
 ########################################
 # Logging Function with Color
@@ -121,7 +126,7 @@ preflight_checks() {
                     command -v transactional-update &>/dev/null || { log "ERROR: transactional-update command not found. Exiting."; exit 1; }
                     ;;
                 *)
-                    log "ERROR: Unsupported OS for driver installation. Exiting."
+                    log "ERROR: Unsupported OS or OS not recognized! Currently the script only supports SLE 15 SP6, SLE Micro 6.0, and Ubuntu 22.04.\nExiting."
                     exit 1
                     ;;
             esac
@@ -222,7 +227,7 @@ EOF
                 fi
                 ;;
             *)
-                log "ERROR: Unsupported OS or OS not recognized! Exiting."
+                log "ERROR: Unsupported OS or OS not recognized! Currently the script only supports SLE 15 SP6, SLE Micro 6.0, and Ubuntu 22.04.\nExiting."
                 exit 1
                 ;;
         esac
