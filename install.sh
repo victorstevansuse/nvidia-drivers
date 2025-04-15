@@ -214,6 +214,7 @@ if [ "$INSTALL_DRIVER" = true ]; then
 zypper --non-interactive addrepo --refresh $NVIDIA_REPO_SLE $NVIDIA_REPO_NAME
 zypper --non-interactive --gpg-auto-import-keys refresh
 zypper --non-interactive install -y nvidia-open-driver-G06-signed-kmp-default nvidia-compute-utils-G06
+zypper --non-interactive install -y -l nvidia-open-driver-G06-signed-kmp-default nvidia-compute-utils-G06
 exit
 EOF
                 log "Transactional update applied."
