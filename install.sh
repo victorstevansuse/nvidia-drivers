@@ -8,7 +8,7 @@
 #
 # Original implementation by Victor Ribeiro <victor.ribeiro@suse.com>
 
-
+set -euo pipefail
 
 
 #
@@ -115,14 +115,17 @@ get_os_version_id() {
   printf "%s\n" "${version_id_line#VERSION_ID=}"
 }
 
+is_ge() {
+  [[ "$(printf '%s\n%s' "$1" "$2" | sort -V | head -n1)" == "$2" ]]
+}
+
 # 
 # Flags and flag parsing
 #
 INSTALL_DRIVER=true
-INSTALL_OPERATOR=true
+INSTALL_OPERATOR=false
 ENABLE_REBOOT=false
 DEPLOY_SAMPLE_WORKLOAD=false
-TIME_SLICING_CONFIG=""
 DRY_RUN=false
 
 usage() {
@@ -132,10 +135,10 @@ GPU Setup Script - Version 1.1.0
 Usage: $0 [options]
 Options:
   -d, --skip-driver             Skip NVIDIA driver installation
-  -o, --skip-operator           Skip NVIDIA GPU Operator installation
+  -o, --install-gpu-operator    Install NVIDIA GPU Operator. (Note: Driver installation and GPU Operator installation are mutually exclusive, since you need GPU capacity on your node before installing the GPU Operator.)
   -r, --enable-reboot           Automatically reboot after driver install
-  -t, --enable-time-slicing     Enable GPU time-slicing config
   -w, --deploy-sample-workload  Deploy a CUDA sample workload (vectoradd)
+  --dry-run                     Explore without changes
   -h, --help                    Show this help message
 EOF
 }
@@ -145,13 +148,8 @@ parse_args() {
   while [[ "$#" -gt 0 ]]; do
     case "$1" in
       -d|--skip-driver)       INSTALL_DRIVER=false;       shift ;;
-      -o|--skip-operator)     INSTALL_OPERATOR=false;     shift ;;
+      -o|--install-gpu-operator)     INSTALL_OPERATOR=true;     shift ;;
       -r|--enable-reboot)     ENABLE_REBOOT=true;        shift ;;
-      -t|--enable-time-slicing)
-        [[ -z "${2:-}" ]] && { log_error "Option '$1' requires a file path"; exit 1; }
-        [[ ! -f $2       ]] && { log_error "File not found: $2";           exit 1; }
-        TIME_SLICING_CONFIG=$2
-        shift 2 ;;
       -w|--deploy-sample-workload) DEPLOY_SAMPLE_WORKLOAD=true; shift ;;
       --dry-run) DRY_RUN=true; shift ;;
       -h|--help)              usage; exit 0 ;;  
@@ -163,58 +161,103 @@ parse_args() {
 preflight_checks() {
   log_info "Running preflight checks."
 
-  if [[ "$EUID" -ne 0 ]]
+  if [[ "$EUID" -ne 0 ]] && [[ "$INSTALL_DRIVER" == "true" ]]
   then
     log_error "Driver installation requires root. Please re-run as root or use --skip-driver."
     exit 1
   fi
 
-  local id
-  id="$(get_os_id)"
-
-  local version_id
-  version_id="$(get_os_version_id)"
-
-  if $INSTALL_DRIVER
+  if $INSTALL_DRIVER && $INSTALL_OPERATOR
   then
-    log_info "Checking OS support"
-    case "$id" in
-      ubuntu)
-          if [[ "$version_id" == "24.04" ]]
-          then
-            log_info "Ubuntu 24.04 detected."
-          else
-            log_error "Ubuntu version $version_id currently not supported. Exiting..."
-            exit 1;
-          fi
-        ;; 
-      sles|suse*) 
-          if [[ "$version_id" == "15.6" ]]
-          then
-            log_info "SUSE Linux Enterprise 15-SP6 detected."
-          else
-            log_error "SUSE Linux Enterprise version $version_id currently not supported. Exiting..."
-            exit 1
-          fi
-        ;; 
-      sle-micro*)
-          if [[ "$version_id" == "6.0" ]]
-          then
-            log_info "SUSE Linux Micro 6.0 detected."
-          else
-            log_error "SUSE Linux Micro version $version_id currently not supported. Exiting..."
-            exit 1;
-          fi
-        ;; 
-      *) log_error "Unsupported OS: $id"; exit 1;
-    esac
+    log_error "Installing GPU Operator and drivers are mutually exclusive operations. GPU Operator requires GPU capacity already configured on you node."
+    exit 1
   fi
 
-  user="$(id -un 2>/dev/null || true)"
+  . /etc/os-release
+  id=${ID//\"/}
+  version_id=${VERSION_ID//\"/}
+
+  if $INSTALL_DRIVER; then
+    log_info "Checking OS support"
+    
+    if command_exists "nvidia-smi" && nvidia-smi &>/dev/null
+      then
+        log_error "NVIDIA driver (nvidia-smi) already present. If you wish to skip driver installation, run with --skip-driver|-d."
+        exit 1
+    fi
+
+
+    if lspci | grep -qi 'nvidia'
+    then
+        log_info "CUDA-capable NVIDIA GPU detected."
+      else
+        log_error "No NVIDIA GPU found on the host — aborting."
+        exit 1
+    fi
+
+    case "$id" in
+      ubuntu)
+        if is_ge "$version_id" "22.04"; then
+          log_info "Ubuntu $version_id detected (>=22.04 supported)."
+        else
+          log_error "Ubuntu $version_id is older than 22.04 — aborting."
+          exit 1
+        fi
+        ;;
+
+      sles*)
+        if [[ "$version_id" == "15.6" ]]; then
+          log_info "SUSE Linux Enterprise Server 15 SP6 detected."
+        else
+          log_error "Only SLES 15 SP6 is supported — found $version_id."
+          exit 1
+        fi
+        ;;
+
+      sl-micro*)
+        if is_ge "$version_id" "6.0"; then
+          log_info "SLE Micro $version_id detected (>=6.0 supported)."
+        else
+          log_error "SLE Micro $version_id is older than 6.0 — aborting."
+          exit 1
+        fi
+        ;;
+
+      *)
+        log_error "Unsupported OS: $id"
+        exit 1
+        ;;
+    esac
+  fi
 
   if $INSTALL_OPERATOR
   then
     log_info "Checking dependencies for NVIDIA GPU Operator installation"
+
+    if kubectl wait --for=condition=Ready node --all --timeout=60s 2>/dev/null
+    then
+      log_info "Control-plane is healthy — continuing"
+    else
+      log_error "Control-plane not healthy — aborting"
+      exit 1
+    fi 
+
+
+    log_info "Checking if the node advertises the resource nvidia.com/gpu"
+    # Note: Installing the NVIDIA GPU Operator only makes sense when at least one node already exposes GPU capacity
+    local gpu_values
+    gpu_values="$(kubectl get nodes \
+      -o jsonpath='{.items[*].status.capacity.nvidia\.com/gpu}' 2>/dev/null)"
+
+    if grep -Eq '^[1-9][0-9]*$' <<<"$(tr ' ' '\n' <<<"${gpu_values}")"
+    then
+        log_info "GPUs detected — values: ${gpu_values:-<none>}" 
+    else
+        log_error 'No NVIDIA GPU capacity found.'
+        exit 1
+    fi
+
+    user="$(id -un 2>/dev/null || true)"
     if [[ "$user" != "root" ]]
     then
       if ! sudo -u "$user" -i command -v helm > /dev/null 2>&1; then
@@ -235,12 +278,11 @@ preflight_checks() {
 
 readonly NVIDIA_DRIVER_REPO="https://download.nvidia.com/suse/sle15sp6/"
 readonly NVIDIA_REPO_NAME="nvidia-sle15sp6-main"
-readonly NVIDIA_DRIVER_VERSION="550.100"
 
 
 install_driver(){
-  local id
-  id=$(get_os_id)
+  . /etc/os-release
+  id=${ID//\"/}
 
   local sh_c="sh -c"
   if $DRY_RUN
@@ -248,45 +290,35 @@ install_driver(){
     sh_c="echo"
   fi
 
-  if command_exists "nvidia-smi" && nvidia-smi &>/dev/null
-  then
-    log_info "NVIDIA driver (nvidia-smi) already present"
-
-  else
-    log_warning "Installing NVIDIA driver..."
-    if "$DRY_RUN"
-    then
-      set -x
-    fi
-
-    case "$id" in
-      ubuntu)
-        $sh_c apt-get update -y
-        $sh_c apt-get install -y "nvidia-driver-535" 
-        ;;
-      sles*)
-        $sh_c zypper ar --refresh "$NVIDIA_DRIVER_REPO" "$NVIDIA_REPO_NAME"
-        $sh_c zypper ref
-        $sh_c zypper in -y -l nvidia-open-driver-G07-signed-kmp="$NVIDIA_DRIVER_VERSION" nvidia-compute-utils-G06="$NVIDIA_DRIVER_VERSION"
-        ;;
-      sl-micro*)
-        $sh_c transactional-update shell <<EOF || error "transactional-update failed"
-          zypper ar --refresh $NVIDIA_REPO_SLE $NVIDIA_REPO_NAME
-          zypper ref
-          zypper in -y -l nvidia-open-driver-G06-signed-kmp-default nvidia-compute-utils-G06
-          exit
+  log_info "Installing NVIDIA driver..."
+  case "$id" in
+    ubuntu)
+      $sh_c 'apt-get update -y'
+      $sh_c "apt-get install -y linux-headers-$(uname -r) build-essential dkms"
+      $sh_c 'apt-get install -y nvidia-driver-535'
+      ;;
+    sles*)
+      $sh_c "zypper ar --refresh $NVIDIA_DRIVER_REPO $NVIDIA_REPO_NAME"
+      $sh_c 'zypper --gpg-auto-import-keys ref'
+      local driver_version
+      driver_version="$(zypper se -s nvidia-open-driver | grep nvidia-open-driver- | sed "s/.* package \+| //g" | sed "s/\s.*//g" | sort -rV | awk NF | head -n 1 | sed "s/[-_].*//g")"
+      $sh_c "zypper in -y -l nvidia-open-driver-G06-signed-kmp nvidia-compute-utils-G06=$driver_version"
+      ;;
+    sl-micro*)
+      local driver_version
+      driver_version="$(zypper se -s nvidia-open-driver | grep nvidia-open-driver- | sed "s/.* package | //g" | sed "s/\s.*//g" | sort | head -n 1 | sed "s/[-_].*//g")"
+      $sh_c 'transactional-update shell' <<EOF || error "transactional-update failed"
+        zypper ar --refresh $NVIDIA_DRIVER_REPO $NVIDIA_REPO_NAME
+        zypper --gpg-auto-import-keys ref
+        zypper in -y -l nvidia-open-driver-G06-signed-kmp nvidia-compute-utils-G06=$driver_version
+        exit
 EOF
-        ;;
-      *)
-        log_error "Unsupported OS for driver installation"
-        exit 1
-        ;;
-    esac
-
-    log_info "Driver installed: $(nvidia-smi --query-gpu=name --format=csv,noheader)"
-  fi
-
-  set +x
+      ;;
+    *)
+      log_error "Unsupported OS for driver installation"
+      exit 1
+      ;;
+  esac
 }
 
 # Install GPU Operator using Helm using the NGC NVIDIA repository.
@@ -296,31 +328,11 @@ EOF
 # Required kubectl and hel,
 IS_NFD_ENABLED=false
 install_gpu_operator(){
-
- 
-  if kubectl wait --for=condition=Ready node --all --timeout=60s 2>/dev/null
+  local sh_c="sh -c"
+  if $DRY_RUN
   then
-    log_info "Control-plane is healthy — continuing"
-  else
-    log_info "Control-plane not healthy — aborting"
-    exit 1
-  fi 
-
-
-  log_info "Checking if the node advertises the resource nvidia.com/gpu"
-  # Note: Installing the NVIDIA GPU Operator only makes sense when at least one node already exposes GPU capacity
-  local -r gpu_values
-  gpu_values="$(kubectl get nodes \
-    -o jsonpath='{.items[*].status.capacity.nvidia\.com/gpu}' 2>/dev/null)"
-
-  if grep -Eq '^[1-9][0-9]*$' <<<"$(tr ' ' '\n' <<<"${gpu_values}")"
-  then
-      log_info 'GPUs detected — values: %s\n' "${gpu_values:-<none>}"
-  else
-      log_error 'No NVIDIA GPU capacity found.'
-      exit 1
+    sh_c="echo"
   fi
-
 
   log_info "Checking for Node Feature Discovery labels..."
   # Using jsonpath instaed of JQ. 
@@ -339,61 +351,34 @@ install_gpu_operator(){
 
   log_info "Creating and labeling gpu-operator namespace..."
 
-  kubectl create ns gpu-operator --dry-run=client -o yaml | kubectl apply -f -
-  kubectl label --overwrite ns gpu-operator pod-security.kubernetes.io/enforce=privileged
+  $sh_c 'kubectl create ns gpu-operator --dry-run=client -o yaml | kubectl apply -f -'
+  $sh_c 'kubectl label --overwrite ns gpu-operator pod-security.kubernetes.io/enforce=privileged'
 
   log_info "Adding/updating NVIDIA Helm repository..."
-  helm repo add nvidia https://helm.ngc.nvidia.com/nvidia
-  helm repo update
-
-  HELM_VALUES=(
-    driver.enabled=false
-    nfd.enabled="$IS_NFD_ENABLED"
-    toolkit.env[0].name=CONTAINERD_SOCKET
-    toolkit.env[0].value=/run/k3s/containerd/containerd.sock
-  )
-
-  if [[ -n $TIME_SLICING_CONFIG ]]; then
-    log_info "Enabling GPU time-slicing from file: $TIME_SLICING_CONFIG"
-
-    # let Helm know which ConfigMap/CR this file creates
-    # Derive a stable name from the file base-name (strip extension)
-    cfg_name="$(basename "$TIME_SLICING_CONFIG")"
-    cfg_name="${cfg_name%.*}"
-
-    HELM_VALUES+=(
-      "devicePlugin.config.name=${cfg_name}"
-      "devicePlugin.config.default=any"
-    )
-
-    kubectl apply -f "$TIME_SLICING_CONFIG"
-  fi
+  $sh_c 'helm repo add nvidia https://helm.ngc.nvidia.com/nvidia'
+  $sh_c 'helm repo update'
 
   log_info "Installing/upgrading NVIDIA GPU Operator..."
-  helm upgrade --install gpu-operator nvidia/gpu-operator \
+  $sh_c "helm upgrade --install gpu-operator nvidia/gpu-operator \
     -n gpu-operator --wait \
-    "$(printf "--set %s " "${HELM_VALUES[@]}")"
+    --set driver.enabled=false \
+    --set nfd.enabled=$IS_NFD_ENABLED \
+    --set toolkit.env[0].name=CONTAINERD_SOCKET \
+    --set toolkit.env[0].value=/run/k3s/containerd/containerd.sock"
 
   log_info "Waiting for GPU Operator deployment to roll out…"
-  kubectl -n gpu-operator rollout status deploy/gpu-operator --timeout=300s
+  $sh_c 'kubectl -n gpu-operator rollout status deploy/gpu-operator --timeout=300s'
 
-  if "$IS_NFD_ENABLED" 
+  if $IS_NFD_ENABLED 
   then
-    log_info "Waiting for NFD deployments…"
-    for svc in node-feature-discovery-master node-feature-discovery-worker; do
-      kubectl -n gpu-operator rollout status deploy/gpu-operator-$svc --timeout=300s
-    done
+      log_info "Waiting for NFD deployments…"
+      for svc in node-feature-discovery-master node-feature-discovery-worker; do
+          $sh_c "kubectl -n gpu-operator rollout status deploy/gpu-operator-$svc --timeout=300s"
+      done
   fi
-
-  info "Pausing for cluster stabilization…"
-  sleep 120
-  info "Waiting for container toolkit health (port 9345)…"
-  until nc -z localhost 9345; do sleep 5; done
-  info "Container toolkit is healthy"
 }
 
 deploy_sample_workload() {
-  log_info "Deploying CUDA sample vectoradd..."
 
   cat <<EOF | kubectl apply -f -
 apiVersion: v1
@@ -425,7 +410,7 @@ EOF
     kubectl logs "cuda-vectoradd" -n default
 
     log_info "Deleting cuda-vectoradd sample pod"
-    kubectl delete -f cuda-vectoradd.yaml
+    kubectl delete pod cuda-vectoradd
   else
     log_error "Sample workload failed (phase: $phase, exit: $exit_code)"
     log_warning "Sample logs:"
@@ -447,7 +432,7 @@ do_install() {
     if "$ENABLE_REBOOT"
     then
       log_warning "Rebooting..."
-      reboot
+      $DRY_RUN || reboot
     else
       log_warning "Reboot disabled. Please reboot manually"
     fi
@@ -456,20 +441,19 @@ do_install() {
   fi
 
 
-  if "$INSTALL_OPERATOR"
+  if $INSTALL_OPERATOR
   then
     log_info "Starting NVIDIA GPU Operator installation."
     install_gpu_operator
-
-    if "$DEPLOY_SAMPLE_WORKLOAD"
-    then
-      deploy_sample_workload
-    fi
-  else
-    log_info "NVIDIA GPU Operator installation skipped."
   fi
 
+  if [[ "$DEPLOY_SAMPLE_WORKLOAD" == true && "$DRY_RUN" != true ]]
+  then
+    log_info "Deploying CUDA VectorADD sample workload"
+    deploy_sample_workload
+  fi
 }
 
+log_info "Done!"
 do_install "$@" 
 
