@@ -1,4 +1,4 @@
-# GPU Setup Script
+# GPU Setup Script (`gpu-setup.sh`) – v1.1.0
 
 > Automated, reproducible installation of **either** NVIDIA drivers **or** the NVIDIA GPU Operator on Kubernetes worker nodes.
 
