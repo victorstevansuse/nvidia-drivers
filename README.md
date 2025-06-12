@@ -102,4 +102,5 @@ sudo ./gpu-setup.sh [flags]
 * **“NVIDIA driver already present”** – rerun with `--skip-driver` if you intentionally keep the existing driver.
 * **“GPUs not found”** – validate hardware passthrough (for VMs) or physical GPU presence.
 * **Operator deploy hangs** – check cluster state (`kubectl get pods -A`) and verify Node Feature Discovery labels.
+* **"Control-plane not healthy" when cluster is available** - make sure to run the script without `sudo` when installing GPU Operator or deploying the sample workload.
 
