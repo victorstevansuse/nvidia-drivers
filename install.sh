@@ -121,8 +121,8 @@ get_os_version_id() {
 INSTALL_DRIVER=true
 INSTALL_OPERATOR=true
 ENABLE_REBOOT=false
-ENABLE_TIME_SLICING=false
 DEPLOY_SAMPLE_WORKLOAD=false
+TIME_SLICING_CONFIG=""
 DRY_RUN=false
 
 usage() {
@@ -147,7 +147,11 @@ parse_args() {
       -d|--skip-driver)       INSTALL_DRIVER=false;       shift ;;
       -o|--skip-operator)     INSTALL_OPERATOR=false;     shift ;;
       -r|--enable-reboot)     ENABLE_REBOOT=true;        shift ;;
-      -t|--enable-time-slicing) ENABLE_TIME_SLICING=true;  shift ;;
+      -t|--enable-time-slicing)
+        [[ -z "${2:-}" ]] && { log_error "Option '$1' requires a file path"; exit 1; }
+        [[ ! -f $2       ]] && { log_error "File not found: $2";           exit 1; }
+        TIME_SLICING_CONFIG=$2
+        shift 2 ;;
       -w|--deploy-sample-workload) DEPLOY_SAMPLE_WORKLOAD=true; shift ;;
       --dry-run) DRY_RUN=true; shift ;;
       -h|--help)              usage; exit 0 ;;  
@@ -171,13 +175,12 @@ preflight_checks() {
   local version_id
   version_id="$(get_os_version_id)"
 
-  # TODO: Check if the OS versions are supported by the script.
   if $INSTALL_DRIVER
   then
     log_info "Checking OS support"
     case "$id" in
       ubuntu)
-          if [[ "$version_id" = "24.04" ]]
+          if [[ "$version_id" == "24.04" ]]
           then
             log_info "Ubuntu 24.04 detected."
           else
@@ -186,7 +189,7 @@ preflight_checks() {
           fi
         ;; 
       sles|suse*) 
-          if [[ "$version_id" = "15.6" ]]
+          if [[ "$version_id" == "15.6" ]]
           then
             log_info "SUSE Linux Enterprise 15-SP6 detected."
           else
@@ -195,7 +198,7 @@ preflight_checks() {
           fi
         ;; 
       sle-micro*)
-          if [[ "$version_id" = "6.0" ]]
+          if [[ "$version_id" == "6.0" ]]
           then
             log_info "SUSE Linux Micro 6.0 detected."
           else
@@ -291,30 +294,34 @@ EOF
 # Configuration for containerd are the same as in the SUSE AI Stack: https://github.com/SUSE/suse-ai-stack/blob/ebf1a105d573dd69b167c78dfdc76644f42c3b05/roles/nvidia-gpu-operator/tasks/main.yml#L57-L60
 # More about configuring time-slicing with GPU Operator here: https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/latest/gpu-sharing.html#configuring-time-slicing-before-installing-the-nvidia-gpu-operator
 # Required kubectl and hel,
-ENABLE_NFD=false
+IS_NFD_ENABLED=false
 install_gpu_operator(){
 
-  log_info "Waiting for Kubernetes API (port 6443)..."
-  local i=0
-  while true; do 
-
-    # Try opening bidirectional sockt on fd 3 (alternative to `nc`)
-    if exec 3<>/dev/tcp/localhost/6443 2>/dev/null
-    then
-      break
-    fi
-
-    i=$(( i + 1))
-    if (( i > 30 ))
-    then
-      log_error "API server unreachable"
-      exit 1
-    fi
-
-    sleep 5
-  done
-  exec 3>&-
  
+  if kubectl wait --for=condition=Ready node --all --timeout=60s 2>/dev/null
+  then
+    log_info "Control-plane is healthy — continuing"
+  else
+    log_info "Control-plane not healthy — aborting"
+    exit 1
+  fi 
+
+
+  log_info "Checking if the node advertises the resource nvidia.com/gpu"
+  # Note: Installing the NVIDIA GPU Operator only makes sense when at least one node already exposes GPU capacity
+  local -r gpu_values
+  gpu_values="$(kubectl get nodes \
+    -o jsonpath='{.items[*].status.capacity.nvidia\.com/gpu}' 2>/dev/null)"
+
+  if grep -Eq '^[1-9][0-9]*$' <<<"$(tr ' ' '\n' <<<"${gpu_values}")"
+  then
+      log_info 'GPUs detected — values: %s\n' "${gpu_values:-<none>}"
+  else
+      log_error 'No NVIDIA GPU capacity found.'
+      exit 1
+  fi
+
+
   log_info "Checking for Node Feature Discovery labels..."
   # Using jsonpath instaed of JQ. 
   # Reference: https://github.com/SUSE/suse-ai-stack/blob/ebf1a105d573dd69b167c78dfdc76644f42c3b05/roles/nvidia-gpu-operator/tasks/main.yml#L17 (which is also in NVIDIA GPU Operator docs installation)
@@ -322,10 +329,10 @@ install_gpu_operator(){
        -o jsonpath='{range .items[*].metadata.labels}{.}{"\n"}{end}' \
      | grep -q '^feature.node.kubernetes.io'
   then
-    ENABLE_NFD=true
+    IS_NFD_ENABLED=true
     log_info "NFD detected."
   else
-    ENABLE_NFD=false
+    IS_NFD_ENABLED=false
     log_info "NFD not detected."
   fi
 
@@ -341,32 +348,25 @@ install_gpu_operator(){
 
   HELM_VALUES=(
     driver.enabled=false
-    nfd.enabled="$ENABLE_NFD"
+    nfd.enabled="$IS_NFD_ENABLED"
     toolkit.env[0].name=CONTAINERD_SOCKET
     toolkit.env[0].value=/run/k3s/containerd/containerd.sock
   )
 
-  if "$ENABLE_TIME_SLICING"
-  then
-    log_info "Enabling GPU time-slicing"
-    # TODO: `time-slicing-config-all` should be a file, get the file in the env variable
-    HELM_VALUES+=(devicePlugin.config.name=time-slicing-config-all \
-                  devicePlugin.config.default=any)
-    log_info "Applying time-slicing config…"
-    cat <<EOF | kubectl_cmd apply -f -
+  if [[ -n $TIME_SLICING_CONFIG ]]; then
+    log_info "Enabling GPU time-slicing from file: $TIME_SLICING_CONFIG"
 
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: time-slicing-config-all
-  namespace: gpu-operator
-data:
-  config.json: |
-    {
-      "default": "any",
-      "name": "time-slicing-config-all"
-    }
-EOF
+    # let Helm know which ConfigMap/CR this file creates
+    # Derive a stable name from the file base-name (strip extension)
+    cfg_name="$(basename "$TIME_SLICING_CONFIG")"
+    cfg_name="${cfg_name%.*}"
+
+    HELM_VALUES+=(
+      "devicePlugin.config.name=${cfg_name}"
+      "devicePlugin.config.default=any"
+    )
+
+    kubectl apply -f "$TIME_SLICING_CONFIG"
   fi
 
   log_info "Installing/upgrading NVIDIA GPU Operator..."
@@ -377,7 +377,7 @@ EOF
   log_info "Waiting for GPU Operator deployment to roll out…"
   kubectl -n gpu-operator rollout status deploy/gpu-operator --timeout=300s
 
-  if "$ENABLE_NFD" 
+  if "$IS_NFD_ENABLED" 
   then
     log_info "Waiting for NFD deployments…"
     for svc in node-feature-discovery-master node-feature-discovery-worker; do
@@ -410,10 +410,28 @@ spec:
         nvidia.com/gpu: 1
 EOF
 
-  kubectl wait --for=condition=Complete --timeout=120s job/vectoradd-sample
-  pod=$(kubectl get pods -n default -l job-name=vectoradd-sample -o jsonpath='{.items[0].metadata.name}')
-  log_info "Sample logs:"
-  kubectl logs "$pod" -n default
+  # wait 60s for the pod to leave pending or running phases
+  kubectl wait "pod/cuda-vectoradd" -n "default" --for=jsonpath='{.status.phase}'=Succeeded --timeout=60s
+  
+  local phase
+  local exit_code
+  phase="$(kubectl get pod "cuda-vectoradd" -n "default" -o jsonpath='{.status.phase}')"
+  exit_code="$(kubectl get pod "cuda-vectoradd" -n "default" -o jsonpath='{.status.containerStatuses[0].state.terminated.exitCode}')"
+
+  if [[ "$phase" == "Succeeded" && "$exit_code" == "0" ]]
+  then
+    log_info "Sample workload finished successfully"
+    log_info "Sample logs:"
+    kubectl logs "cuda-vectoradd" -n default
+
+    log_info "Deleting cuda-vectoradd sample pod"
+    kubectl delete -f cuda-vectoradd.yaml
+  else
+    log_error "Sample workload failed (phase: $phase, exit: $exit_code)"
+    log_warning "Sample logs:"
+
+    kubectl logs "cuda-vectoradd" -n default
+  fi
 }
 
 
